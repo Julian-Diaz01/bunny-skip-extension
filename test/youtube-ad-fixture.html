@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Bunny Skip — YouTube ad engine fixture</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; max-width: 720px; }
+    #movie_player { width: 480px; height: 270px; background: #000; position: relative; color: #fff; }
+    #movie_player video { width: 100%; height: 100%; background: #111; }
+    .ytp-ad-skip-button-modern {
+      position: absolute; right: 12px; bottom: 12px; padding: 8px 14px;
+      background: #222; color: #fff; border: 1px solid #555; cursor: pointer;
+    }
+    button { padding: 6px 12px; margin: 4px 6px 4px 0; }
+    #log { white-space: pre-wrap; background: #f4f4f4; padding: 12px; border-radius: 6px; }
+    .pass { color: #167a3c; } .fail { color: #b3261e; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>Bunny Skip — YouTube ad engine fixture</h1>
+  <p>Loads the real <code>storage/rules-store.js</code> + <code>content/engine.js</code> against a mock YouTube player.</p>
+
+  <div id="movie_player" class="html5-video-player">
+    <video id="v"></video>
+  </div>
+
+  <p>
+    <button id="btn-start-skippable">Start skippable ad</button>
+    <button id="btn-start-unskippable">Start unskippable ad</button>
+    <button id="btn-end-ad">End ad</button>
+    <button id="btn-run-suite">Run full suite</button>
+  </p>
+
+  <div id="log">waiting…</div>
+
+  <!-- ---- chrome API shim (must exist before rules-store.js / engine.js) ---- -->
+  <script>
+    (function () {
+      const store = {};
+      const changeListeners = [];
+      window.chrome = {
+        runtime: { lastError: null, id: 'fixture', getURL: (p) => p },
+        storage: {
+          local: {
+            get(keys, cb) {
+              const out = {};
+              const list = Array.isArray(keys) ? keys : typeof keys === 'string' ? [keys] : Object.keys(keys || store);
+              list.forEach((k) => { if (k in store) out[k] = store[k]; });
+              cb(out);
+            },
+            set(obj, cb) { Object.assign(store, obj); if (cb) cb(); },
+          },
+          onChanged: { addListener: (fn) => changeListeners.push(fn) },
+        },
+      };
+    })();
+  </script>
+
+  <!-- ---- video instrumentation: give the mock <video> a finite duration and spy on writes ---- -->
+  <script>
+    window.__spy = { currentTimeWrites: [], muteWrites: [] };
+    const v = document.getElementById('v');
+    let _ct = 0;
+    Object.defineProperty(v, 'duration', { get: () => 30, configurable: true });
+    Object.defineProperty(v, 'currentTime', {
+      get: () => _ct,
+      set: (val) => { _ct = val; window.__spy.currentTimeWrites.push(val); },
+      configurable: true,
+    });
+    let _muted = false;
+    Object.defineProperty(v, 'muted', {
+      get: () => _muted,
+      set: (val) => { _muted = !!val; window.__spy.muteWrites.push(!!val); },
+      configurable: true,
+    });
+  </script>
+
+  <script src="../storage/rules-store.js"></script>
+
+  <!-- ---- inject the two YouTube seed rules directly (bypass hostname match on file://) ---- -->
+  <script>
+    RulesStore.getRulesForSite = async function () {
+      return [
+        {
+          id: 'r-skip', site: 'youtube.com', label: 'Skip Ad (YouTube)',
+          matchType: 'css-selector',
+          matchValue: '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button',
+          action: 'click', enabled: true, source: 'seed',
+        },
+        {
+          id: 'r-seek', site: 'youtube.com', label: 'Speed through unskippable ads (YouTube)',
+          matchType: 'css-selector',
+          matchValue: '#movie_player.ad-showing, .html5-video-player.ad-showing',
+          action: 'seek-end', enabled: true, source: 'seed',
+        },
+      ];
+    };
+  </script>
+
+  <script src="../content/engine.js"></script>
+
+  <!-- ---- fixture controls + assertions ---- -->
+  <script>
+    const player = document.getElementById('movie_player');
+    const logEl = document.getElementById('log');
+    const spy = window.__spy;
+    let skipClicks = 0;
+
+    function fxLog(msg, cls) {
+      const line = document.createElement('div');
+      if (cls) line.className = cls;
+      line.textContent = msg;
+      if (logEl.textContent === 'waiting…') logEl.textContent = '';
+      logEl.appendChild(line);
+      console.log('[fixture]', msg);
+    }
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Ad-only marker the engine's adIsOnScreen() guard requires, alongside
+    // the `.ad-showing` class — mirrors YouTube's real ad overlay node.
+    function addAdMarker() {
+      if (player.querySelector('.ytp-ad-player-overlay')) return;
+      const m = document.createElement('div');
+      m.className = 'ytp-ad-player-overlay';
+      player.appendChild(m);
+    }
+    // Real YouTube markup: <button class="ytp-skip-ad-button" style="opacity:.5">
+    // rendered faded during the countdown, then flipped to opacity 1.
+    function addSkipButton() {
+      if (player.querySelector('.ytp-skip-ad-button')) return;
+      const b = document.createElement('button');
+      b.className = 'ytp-skip-ad-button';
+      b.id = 'skip-button:2';
+      b.style.opacity = '0.5';
+      b.innerHTML = '<div class="ytp-skip-ad-button__text">Skip</div>' +
+        '<span class="ytp-skip-ad-button__icon"></span>';
+      b.addEventListener('click', () => {
+        skipClicks++;
+        endAd();
+        fxLog('  (mock) skip button clicked → ad ended');
+      });
+      player.appendChild(b);
+    }
+    function activateSkipButton() {
+      const b = player.querySelector('.ytp-skip-ad-button');
+      if (b) {
+        b.style.opacity = '1';
+        fxLog('  (mock) skip button became clickable (opacity 1)');
+      }
+    }
+    function startSkippable() {
+      spy.currentTimeWrites.length = 0;
+      player.classList.add('ad-showing');
+      addAdMarker();
+      addSkipButton();
+      fxLog('ad started (skippable): .ad-showing + ad marker + faded skip button');
+    }
+    function startUnskippable() {
+      spy.currentTimeWrites.length = 0;
+      _resetVideoPos();
+      player.classList.add('ad-showing');
+      addAdMarker();
+      fxLog('ad started (unskippable): .ad-showing + ad marker, no skip button');
+    }
+    function endAd() {
+      player.classList.remove('ad-showing');
+      const b = player.querySelector('.ytp-skip-ad-button');
+      if (b) b.remove();
+      const m = player.querySelector('.ytp-ad-player-overlay');
+      if (m) m.remove();
+      fxLog('ad ended');
+    }
+    function _resetVideoPos() { document.getElementById('v').currentTime = 0; }
+    // `.ad-showing` set WITHOUT any ad-only marker element — mimics the
+    // race where YouTube has swapped media back to content but not yet
+    // dropped the class. The engine must NOT touch the video here.
+    function fakeAdShowingNoMarker() {
+      _resetVideoPos();
+      player.classList.add('ad-showing');
+      fxLog('`.ad-showing` set with NO ad marker (content-swap race)');
+    }
+
+    document.getElementById('btn-start-skippable').onclick = startSkippable;
+    document.getElementById('btn-start-unskippable').onclick = startUnskippable;
+    document.getElementById('btn-end-ad').onclick = endAd;
+    document.getElementById('btn-run-suite').onclick = runSuite;
+
+    async function runSuite() {
+      logEl.textContent = '';
+      skipClicks = 0;
+      spy.currentTimeWrites.length = 0;
+      spy.muteWrites.length = 0;
+      let passed = 0, failed = 0;
+      const check = (name, cond) => {
+        if (cond) { passed++; fxLog('PASS  ' + name, 'pass'); }
+        else { failed++; fxLog('FAIL  ' + name, 'fail'); }
+      };
+
+      // Test 1a: faded skip button (opacity 0.5) — engine must NOT click it yet
+      // and must NOT consume the node.
+      startSkippable();
+      await wait(600);
+      check('faded skip button (opacity 0.5): not clicked yet', skipClicks === 0);
+
+      // Test 1b: button flips to opacity 1 — engine clicks it and the ad ends.
+      activateSkipButton();
+      await wait(600);
+      check('active skip button (opacity 1): clicked', skipClicks >= 1);
+      check('skippable ad: ad cleared', !player.classList.contains('ad-showing'));
+
+      // Test 2: unskippable ad — engine fast-forwards the ad <video> near its end and mutes it.
+      startUnskippable();
+      await wait(600);
+      check('unskippable ad: video fast-forwarded toward duration (>= 29.5)',
+        spy.currentTimeWrites.some((t) => t >= 29.5));
+      check('unskippable ad: video muted while ad plays', spy.muteWrites.includes(true));
+
+      // Test 3: ad ends — engine restores audio.
+      endAd();
+      await wait(600);
+      check('after ad: video un-muted (audio restored)',
+        spy.muteWrites.length > 0 && spy.muteWrites[spy.muteWrites.length - 1] === false);
+
+      // Test 4 (HIGH #1 guard): `.ad-showing` but no ad marker → engine must not seek.
+      fakeAdShowingNoMarker();               // this does its own currentTime=0 reset
+      const seeksBeforeT4 = spy.currentTimeWrites.length; // measure AFTER the fixture's reset
+      const mutesBeforeT4 = spy.muteWrites.length;
+      await wait(600);
+      check('content-swap race: no seek performed', spy.currentTimeWrites.length === seeksBeforeT4);
+      check('content-swap race: no mute performed', spy.muteWrites.length === mutesBeforeT4);
+      player.classList.remove('ad-showing');
+
+      // Test 5: fully idle — engine does nothing further.
+      const seeksBeforeT5 = spy.currentTimeWrites.length;
+      await wait(400);
+      check('idle (no ad): no further seeks', spy.currentTimeWrites.length === seeksBeforeT5);
+
+      fxLog('');
+      fxLog(`${passed} passed, ${failed} failed`, failed ? 'fail' : 'pass');
+      window.__suiteResult = { passed, failed };
+    }
+  </script>
+</body>
+</html>

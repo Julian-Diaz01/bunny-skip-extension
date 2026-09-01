@@ -127,12 +127,39 @@ function isVisible(el) {
   return el.offsetWidth > 0 && el.offsetHeight > 0;
 }
 
+// A button the site has rendered but not yet activated. YouTube's
+// `.ytp-skip-ad-button` sits at `opacity: 0.5` during the pre-skip
+// countdown, then flips to 1 when it becomes clickable; clicking it early
+// is a no-op. Return false here so the node is NOT consumed and a later
+// scan retries once it's live.
+function isClickReady(el) {
+  if (el.disabled === true) {
+    return false;
+  }
+  if (typeof el.getAttribute === 'function' && el.getAttribute('aria-disabled') === 'true') {
+    return false;
+  }
+  try {
+    const opacity = parseFloat(getComputedStyle(el).opacity);
+    if (Number.isFinite(opacity) && opacity < 0.9) {
+      return false;
+    }
+  } catch (err) {
+    // getComputedStyle can throw for a detached node — treat as ready.
+  }
+  return true;
+}
+
 function tryClick(rule, el) {
   if (clickedNodes.has(el)) {
     return false;
   }
   if (!isVisible(el)) {
     return false;
+  }
+  if (!isClickReady(el)) {
+    log('element not ready (disabled/faded), will retry', rule.id);
+    return false; // not added to clickedNodes — retried on a later scan
   }
 
   clickedNodes.add(el);
@@ -147,13 +174,98 @@ function tryClick(rule, el) {
 }
 
 // ---------------------------------------------------------------------
+// "seek-end" action. Some ads (YouTube's unskippable pre/mid-roll) have
+// no Skip button to click — instead the matched element is the *ad
+// container*, and clearing the ad means jumping its underlying <video>
+// to the end. We also mute that video while it plays and hand audio
+// back once the container disappears. Still fully rule-driven: the rule
+// picks the DOM signal, only the action differs.
+// ---------------------------------------------------------------------
+
+const mutedByUs = new Set(); // <video> elements this script muted
+
+// Ad-only markers YouTube adds while (and only while) an ad is on screen.
+// Requiring one of these — in addition to the rule's own match — guards
+// against seeking the *content* video during the brief window where the
+// player still carries `.ad-showing` after the media has swapped back.
+const AD_MARKER_SELECTOR =
+  '.ad-showing .ytp-ad-player-overlay, .ad-showing .ytp-ad-player-overlay-layout, ' +
+  '.ad-showing .ytp-ad-module :first-child, .ytp-ad-text, .ytp-ad-preview-container, ' +
+  '.ytp-ad-skip-button-container, .ytp-ad-duration-remaining';
+
+function adIsOnScreen() {
+  return (
+    !!document.querySelector('.ad-showing, .ad-interrupting') &&
+    !!document.querySelector(AD_MARKER_SELECTOR)
+  );
+}
+
+// Only ever returns a <video> that lives inside the matched ad container
+// — never a page-wide fallback that could resolve to the content video.
+function resolveAdVideo(el) {
+  if (el instanceof HTMLVideoElement) {
+    return el;
+  }
+  if (el && typeof el.querySelector === 'function') {
+    return el.querySelector('video');
+  }
+  return null;
+}
+
+function maybeSeekAdVideo(container) {
+  if (!adIsOnScreen()) {
+    return false;
+  }
+  const video = resolveAdVideo(container);
+  if (!video) {
+    return false;
+  }
+  const duration = video.duration;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return false;
+  }
+  if (!video.muted) {
+    video.muted = true;
+    mutedByUs.add(video);
+  }
+  const target = Math.max(0, duration - 0.1);
+  if (video.currentTime >= target) {
+    return false; // already at the end — nothing left to skip
+  }
+  try {
+    video.currentTime = target;
+    log('fast-forwarded ad video to end', target);
+    return true;
+  } catch (err) {
+    log('seek threw', err);
+    return false;
+  }
+}
+
+function restoreMutedVideos() {
+  for (const video of mutedByUs) {
+    if (document.contains(video)) {
+      video.muted = false;
+    }
+  }
+  mutedByUs.clear();
+}
+
+// ---------------------------------------------------------------------
 // Scanning.
 // ---------------------------------------------------------------------
 
 function scan() {
   if (activeRules.length === 0) {
+    // No rules at all (disabled/deleted/permission revoked) — never leave
+    // a video we muted stuck muted.
+    if (mutedByUs.size > 0) {
+      restoreMutedVideos();
+    }
     return;
   }
+
+  let seekAdMatched = false;
 
   for (const rule of activeRules) {
     if (!rule.enabled) {
@@ -165,9 +277,27 @@ function scan() {
       log('rule matched', rule.id, rule.label || rule.matchValue, 'candidates:', candidates.length);
     }
 
+    if (rule.action === 'seek-end') {
+      if (candidates.length > 0) {
+        seekAdMatched = true;
+        for (const el of candidates) {
+          maybeSeekAdVideo(el);
+        }
+      }
+      continue;
+    }
+
+    // Default action: click.
     for (const el of candidates) {
       tryClick(rule, el);
     }
+  }
+
+  // Nothing matched a seek-end rule this pass — the ad is over (or the
+  // rule was turned off). Hand audio back regardless of whether a
+  // seek-end rule is still active.
+  if (!seekAdMatched && mutedByUs.size > 0) {
+    restoreMutedVideos();
   }
 }
 
@@ -220,7 +350,16 @@ function watchDom() {
   const observer = new MutationObserver(() => {
     scheduleRescan();
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+  // `attributeFilter` catches the moment a countdown button flips from
+  // disabled/faded to live (YouTube toggles inline `style`/`class`),
+  // which a childList-only observer would miss. The 200 ms debounce
+  // keeps this cheap despite YouTube's constant DOM churn.
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['style', 'class', 'disabled', 'aria-disabled', 'hidden'],
+  });
 }
 
 // ---------------------------------------------------------------------
