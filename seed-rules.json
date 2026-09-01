@@ -37,5 +37,25 @@
     "action": "click",
     "enabled": true,
     "source": "seed"
+  },
+  {
+    "site": "youtube.com",
+    "label": "Skip Ad (YouTube)",
+    "matchType": "css-selector",
+    "matchValue": ".ytp-skip-ad-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button",
+    "action": "click",
+    "enabled": false,
+    "source": "seed",
+    "_since": 2
+  },
+  {
+    "site": "youtube.com",
+    "label": "Speed through unskippable ads (YouTube)",
+    "matchType": "css-selector",
+    "matchValue": "#movie_player.ad-showing, .html5-video-player.ad-showing",
+    "action": "seek-end",
+    "enabled": false,
+    "source": "seed",
+    "_since": 2
   }
 ]

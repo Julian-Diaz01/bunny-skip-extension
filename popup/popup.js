@@ -14,6 +14,61 @@
     'css-selector': "Matches the button's position in the page structure. Least reliable — breaks easily when the site redeploys.",
   };
 
+  // youtube.com isn't a built-in host permission — it's optional and
+  // requested only when the user first enables a YouTube rule.
+  const YOUTUBE_ORIGIN_PATTERN = '*://*.youtube.com/*';
+
+  function siteNeedsOptionalPermission(site) {
+    return typeof site === 'string' && site.includes('youtube.com');
+  }
+
+  // Prompts for the optional youtube.com host permission if it isn't
+  // already held. Must be called from a user gesture (a click/change
+  // handler). Returns true if the permission is granted afterwards.
+  async function ensureSitePermission(site) {
+    if (!siteNeedsOptionalPermission(site)) {
+      return true;
+    }
+    if (!chrome.permissions || !chrome.permissions.request) {
+      return true; // e.g. the offline popup mock — nothing to gate on
+    }
+    try {
+      const held = await chrome.permissions.contains({ origins: [YOUTUBE_ORIGIN_PATTERN] });
+      if (held) {
+        return true;
+      }
+      return await chrome.permissions.request({ origins: [YOUTUBE_ORIGIN_PATTERN] });
+    } catch (err) {
+      return false;
+    }
+  }
+
+  // Surfaces a message on the Add Rule panel's status line (visible from
+  // any panel once switched to) instead of a popup-dismissing alert().
+  function announce(message) {
+    switchPanel('panel-add-rule');
+    clearPickerStatusTimer();
+    showPickerStatus(message);
+    pickerStatusTimer = setTimeout(hidePickerStatus, 6000);
+  }
+
+  // Once no youtube.com rule is enabled any more, hand the host
+  // permission back so the extension can't run on YouTube.
+  async function maybeReleaseYouTubePermission() {
+    if (!chrome.permissions || !chrome.permissions.remove) {
+      return;
+    }
+    try {
+      const rules = await RulesStore.getRules();
+      const stillUsed = rules.some((r) => siteNeedsOptionalPermission(r.site) && r.enabled);
+      if (!stillUsed) {
+        await chrome.permissions.remove({ origins: [YOUTUBE_ORIGIN_PATTERN] });
+      }
+    } catch (err) {
+      // Best effort — leaving the permission in place is harmless.
+    }
+  }
+
   let currentHostname = '';
   let editingRuleId = null; // null => form is in "add" mode; otherwise editing this rule id
   let pickerStatusTimer = null;
@@ -218,8 +273,36 @@
       switchPanel('panel-add-rule');
       renderPickerConfirmation(pickerPending);
       highlightRule(pickerPending.savedRuleId);
+      await reconcilePickerYouTubeRule(pickerPending);
     } else {
       showNoCandidatesMessage();
+    }
+  }
+
+  // The picker auto-saves the best match before the popup reopens, so it
+  // can't prompt for the optional youtube.com permission (no user
+  // gesture). If a YouTube rule was saved without that permission, flip
+  // it off here so its state is honest — enabling it later prompts.
+  async function reconcilePickerYouTubeRule(pending) {
+    if (!pending.savedRuleId || !siteNeedsOptionalPermission(pending.site)) {
+      return;
+    }
+    if (!chrome.permissions || !chrome.permissions.contains) {
+      return;
+    }
+    try {
+      const held = await chrome.permissions.contains({ origins: [YOUTUBE_ORIGIN_PATTERN] });
+      if (held) {
+        return;
+      }
+      await RulesStore.updateRule(pending.savedRuleId, { enabled: false });
+      await renderAll();
+      switchPanel('panel-add-rule');
+      highlightRule(pending.savedRuleId);
+      clearPickerStatusTimer();
+      showPickerStatus('Saved as off — turn it on in the list to let Bunny Skip run on YouTube.');
+    } catch (err) {
+      // Leave the rule as saved.
     }
   }
 
@@ -353,7 +436,19 @@
     checkbox.title = rule.enabled ? 'Enabled' : 'Disabled';
     checkbox.setAttribute('aria-label', rule.enabled ? 'Enabled' : 'Disabled');
     checkbox.addEventListener('change', async () => {
+      const enabling = checkbox.checked;
+      if (enabling && siteNeedsOptionalPermission(rule.site)) {
+        const granted = await ensureSitePermission(rule.site);
+        if (!granted) {
+          checkbox.checked = false;
+          announce('YouTube access is needed to run this rule — it was left off. Toggle it on again to grant access.');
+          return;
+        }
+      }
       await RulesStore.toggleRule(rule.id);
+      if (!enabling) {
+        await maybeReleaseYouTubePermission();
+      }
       await renderAll();
     });
     toggle.appendChild(checkbox);
@@ -801,14 +896,25 @@
       return;
     }
 
-    if (editingRuleId) {
-      await RulesStore.updateRule(editingRuleId, patch);
-    } else {
-      await RulesStore.addRule(patch);
+    let deniedYouTube = false;
+    const savedRule = editingRuleId
+      ? await RulesStore.updateRule(editingRuleId, patch)
+      : await RulesStore.addRule(patch);
+
+    if (siteNeedsOptionalPermission(savedRule.site) && savedRule.enabled) {
+      const granted = await ensureSitePermission(savedRule.site);
+      if (!granted) {
+        await RulesStore.updateRule(savedRule.id, { enabled: false });
+        deniedYouTube = true;
+      }
     }
 
     resetFormToAddMode();
     await renderAll();
-    switchPanel(currentHostname && currentHostname.includes(patch.site) ? 'panel-current-site' : 'panel-other-sites');
+    if (deniedYouTube) {
+      announce('Rule saved but left off — YouTube access was declined. Toggle it on to grant access.');
+    } else {
+      switchPanel(currentHostname && currentHostname.includes(patch.site) ? 'panel-current-site' : 'panel-other-sites');
+    }
   }
 })();
